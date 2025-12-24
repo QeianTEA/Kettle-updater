@@ -1,13 +1,11 @@
 #!/usr/bin/env python3
 """
-Kettle Updater - GUI:
-- detects Kettle (best-effort),
+Kettle Updater - GUI (fixed):
+- detects device (best-effort),
 - downloads GitHub repo branch as zip,
-- syncs files to the Kettle using mpremote (invoked as a module),
+- syncs files to the device using mpremote invoked IN-PROCESS (no spawning the exe),
 - writes logs to C:\kettle_updater_logs\ (fallback to user home),
 - shows a happy face on success.
-
-Save as kettle_updater.py
 """
 
 import os
@@ -16,9 +14,7 @@ import tempfile
 import urllib.request
 import zipfile
 import shutil
-import subprocess
 import threading
-import time
 import traceback
 from datetime import datetime
 from tkinter import Tk, Label, Entry, Button, StringVar, W, E, messagebox
@@ -29,6 +25,10 @@ try:
 except Exception:
     list_ports = None
 
+# For in-process mpremote invocation
+import runpy
+import io
+
 # ----------------- Logging setup -----------------
 
 def get_log_dir():
@@ -37,19 +37,16 @@ def get_log_dir():
     if os.name == "nt":
         preferred = r"C:\kettle_updater_logs"
     else:
-        # non-windows fallback
         preferred = os.path.join(os.path.expanduser("~"), ".kettle_updater_logs")
 
     try:
         os.makedirs(preferred, exist_ok=True)
-        # test write permission
         test_path = os.path.join(preferred, ".write_test")
         with open(test_path, "w", encoding="utf-8") as f:
             f.write("ok")
         os.remove(test_path)
         return preferred
     except Exception:
-        # fallback to user home
         fallback = os.path.join(os.path.expanduser("~"), ".kettle_updater_logs")
         os.makedirs(fallback, exist_ok=True)
         return fallback
@@ -62,20 +59,24 @@ def new_log_path(prefix="kettle_updater"):
     return os.path.join(LOG_DIR, fname)
 
 def write_log(text, prefix="kettle_updater"):
+    """
+    Write `text` to a new log file and return the path.
+    Robust fallback to temp dir if needed.
+    """
     path = new_log_path(prefix)
     try:
         with open(path, "w", encoding="utf-8") as f:
             f.write(text)
+        return path
     except Exception:
-        # last resort: write to temp dir
-        tmp = os.path.join(tempfile.gettempdir(), fname)
+        # last-resort fallback in temp dir
         try:
+            tmp = os.path.join(tempfile.gettempdir(), os.path.basename(path))
             with open(tmp, "w", encoding="utf-8") as f:
                 f.write(text)
             return tmp
         except Exception:
             return None
-    return path
 
 def append_to_log(path, text):
     try:
@@ -88,7 +89,7 @@ def append_to_log(path, text):
 
 def detect_kettle_ports():
     """
-    Best-effort detection of kettle-like serial ports.
+    Best-effort detection of device-like serial ports.
     Returns list of port strings (Windows: COMx).
     """
     results = []
@@ -102,15 +103,14 @@ def detect_kettle_ports():
             except Exception:
                 vid = pid = None
             desc = " ".join(filter(None, [p.description, p.product, p.manufacturer])).lower()
-            # Heuristics - common vendor id for Raspberry Pi is 0x2E8A but clones vary.
-            if vid is not None and vid in (0x2E8A, 0x2e8a, 0x1d50, 0x10c4, 0x0403):
+            # Heuristics: common VID values and descriptive strings
+            if vid is not None and vid in (0x2E8A, 0x1D50, 0x10C4, 0x0403):
                 results.append(p.device)
                 continue
-            if any(k in desc for k in ("kettle", "raspberry", "rp2040", "usb serial", "usb-serial")):
+            if any(k in desc for k in ("kettle", "pico", "raspberry", "rp2040", "usb serial", "usb-serial")):
                 results.append(p.device)
                 continue
     except Exception:
-        # If detection fails, return empty and let mpremote auto-detect
         return []
     return results
 
@@ -119,7 +119,6 @@ def download_github_zip(repo_url, branch="main"):
     Download GitHub repo as zip and extract.
     Returns (tmpdir, repo_root).
     """
-    # Normalize
     if repo_url.endswith(".git"):
         repo_url = repo_url[:-4]
     if repo_url.startswith("git@github.com:"):
@@ -149,56 +148,95 @@ def download_github_zip(repo_url, branch="main"):
     repo_root = entries[0]
     return tmpdir, repo_root
 
+def run_mpremote_inprocess(argv_list, status_callback=None, timeout_seconds=900):
+    """
+    Run mpremote in-process using runpy.run_module('mpremote').
+    - argv_list should be like: ['mpremote','connect','auto','fs','sync','<local_path>',':']
+    Returns (rc, output, logpath)
+    rc: 0 success, nonzero error.
+    """
+    logpath = new_log_path("mpremote")
+    # capture stdout/stderr
+    old_argv = sys.argv[:]
+    old_stdout = sys.stdout
+    old_stderr = sys.stderr
+    sio_out = io.StringIO()
+    sio_err = io.StringIO()
+    sys.argv = argv_list[:]  # mpremote reads sys.argv
+    sys.stdout = sio_out
+    sys.stderr = sio_err
+    rc = 0
+    try:
+        # run the mpremote module as __main__ (this runs the CLI)
+        runpy.run_module("mpremote", run_name="__main__")
+    except SystemExit as se:
+        # mpremote may call sys.exit(n)
+        try:
+            rc = int(se.code) if (se.code is not None and str(se.code).isdigit()) else (0 if se.code is None else 1)
+        except Exception:
+            rc = 1
+    except Exception:
+        rc = 1
+        sio_err.write("\nUNCAUGHT EXCEPTION IN mpremote:\n")
+        sio_err.write(traceback.format_exc())
+    finally:
+        # restore
+        sys.argv = old_argv
+        sys.stdout = old_stdout
+        sys.stderr = old_stderr
+        out_text = sio_out.getvalue() + "\n" + sio_err.getvalue()
+        try:
+            with open(logpath, "w", encoding="utf-8") as f:
+                f.write(f"COMMAND: {' '.join(argv_list)}\n\n")
+                f.write(out_text)
+        except Exception:
+            pass
+        return rc, out_text, logpath
+
 def run_mpremote_sync(local_path, port=None, extra_args=None, status_callback=None):
     """
-    Run mpremote as a module: python -m mpremote ...
-    Returns (rc, full_output, logpath).
+    High-level wrapper that prefers in-process invocation.
+    Builds argv and calls run_mpremote_inprocess.
     """
     if extra_args is None:
         extra_args = []
     target = "auto" if port is None else port
-    # Use sys.executable -m mpremote so mpremote is invoked as a module
-    cmd = [sys.executable, "-m", "mpremote", "connect", target, "fs", "sync", local_path, ":"] + extra_args
+    argv = ["mpremote", "connect", target, "fs", "sync", local_path, ":"] + extra_args
     if status_callback:
-        status_callback(f"Running: {' '.join(cmd)}")
-    logpath = new_log_path("mpremote")
+        status_callback(f"Invoking mpremote (in-process)...")
+    # Try in-process first (works well when mpremote is bundled into exe as a module)
     try:
-        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=900)
-        out = proc.stdout or ""
-        # Always write the output to a log file for debugging
-        try:
-            with open(logpath, "w", encoding="utf-8") as f:
-                f.write(f"COMMAND: {' '.join(cmd)}\n\n")
-                f.write(out)
-        except Exception:
-            pass
-        return proc.returncode, out, logpath
-    except FileNotFoundError as e:
-        msg = ("mpremote not found when invoking as module. Make sure mpremote is installed "
-               "in the same Python environment used to build the exe. (pip install mpremote)")
-        try:
-            with open(logpath, "w", encoding="utf-8") as f:
-                f.write(msg + "\n\n" + traceback.format_exc())
-        except Exception:
-            pass
-        return 127, msg + "\n" + str(e), logpath
-    except subprocess.TimeoutExpired as e:
-        out = getattr(e, "output", "") or ""
-        try:
-            with open(logpath, "w", encoding="utf-8") as f:
-                f.write("mpremote timed out\n\n")
-                f.write(out)
-        except Exception:
-            pass
-        return 124, "mpremote timed out", logpath
+        rc, out, logpath = run_mpremote_inprocess(argv, status_callback=status_callback)
+        return rc, out, logpath
     except Exception as e:
+        # Fallback: try subprocess (may spawn exe if packaged; we log that attempt)
+        fallback_log = new_log_path("mpremote_fallback")
         try:
-            with open(logpath, "w", encoding="utf-8") as f:
-                f.write("Unexpected error running mpremote:\n")
-                f.write(traceback.format_exc())
+            with open(fallback_log, "w", encoding="utf-8") as f:
+                f.write("Falling back to subprocess invocation\n")
         except Exception:
             pass
-        return 1, f"Unexpected error: {e}", logpath
+        try:
+            import subprocess
+            cmd = [sys.executable, "-m", "mpremote"] + argv[1:]
+            if status_callback:
+                status_callback(f"Running fallback subprocess: {' '.join(cmd)}")
+            proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=900)
+            out = proc.stdout or ""
+            try:
+                with open(fallback_log, "a", encoding="utf-8") as f:
+                    f.write(out)
+            except Exception:
+                pass
+            return proc.returncode, out, fallback_log
+        except Exception as e2:
+            msg = f"Both in-process and subprocess mpremote failed: {e}\nFallback error: {e2}"
+            try:
+                with open(fallback_log, "a", encoding="utf-8") as f:
+                    f.write(msg + "\n" + traceback.format_exc())
+            except Exception:
+                pass
+            return 1, msg, fallback_log
 
 # ----------------- GUI -----------------
 
@@ -234,6 +272,15 @@ class KettleUpdaterGUI:
             self.status_label.config(text=text)
         self.master.after(0, _set)
 
+    def show_error_box(self, title, msg):
+        # ensure messagebox is called on main thread
+        def _show():
+            try:
+                messagebox.showerror(title, msg)
+            except Exception:
+                pass
+        self.master.after(0, _show)
+
     def on_run(self):
         repo = self.repo_var.get().strip()
         branch = self.branch_var.get().strip() or "main"
@@ -241,6 +288,7 @@ class KettleUpdaterGUI:
         if not repo:
             self.set_status("Please enter a GitHub repo URL (e.g. https://github.com/user/repo).")
             return
+        # disable UI while running
         self.run_button.config(state="disabled")
         self.set_status("Starting update...")
         threading.Thread(target=self.worker, args=(repo, branch, subfolder), daemon=True).start()
@@ -250,7 +298,7 @@ class KettleUpdaterGUI:
         primary_log = new_log_path("session")
         try:
             append_to_log(primary_log, f"Start: {datetime.now().isoformat()}\n")
-            self.set_status("Detecting Kettle (best-effort)...")
+            self.set_status("Detecting device (best-effort)...")
             ports = detect_kettle_ports()
             if ports:
                 porttxt = ", ".join(ports)
@@ -258,7 +306,7 @@ class KettleUpdaterGUI:
                 chosen_port = ports[0]
                 append_to_log(primary_log, f"Detected ports: {porttxt}\n")
             else:
-                self.set_status("No Kettle-like serial port found. Will let mpremote auto-detect.")
+                self.set_status("No device-like serial port found. Will let mpremote auto-detect.")
                 chosen_port = None
                 append_to_log(primary_log, "No ports auto-detected; using mpremote auto\n")
 
@@ -272,19 +320,16 @@ class KettleUpdaterGUI:
                     raise RuntimeError(f"Subfolder '{subfolder}' not found in the repo.")
                 sync_path = candidate
 
-            self.set_status("Syncing files to Kettle...")
+            self.set_status("Syncing files to device (mpremote)...")
             rc, output, mp_log = run_mpremote_sync(sync_path, port=chosen_port, status_callback=self.set_status)
             append_to_log(primary_log, f"mpremote return code: {rc}\nmpremote log: {mp_log}\n")
             if rc == 0:
                 self.set_status("😄 done!")
                 append_to_log(primary_log, "Success!\n")
-                # Write a short success log
                 write_log(f"Sync succeeded at {datetime.now().isoformat()}\nRepo: {repo}\nBranch: {branch}\n", prefix="success")
             else:
-                # Save both mpremote log and session log for reporting
                 out_text = f"mpremote rc={rc}\n\nmpremote output:\n{output}\n"
                 append_to_log(primary_log, out_text)
-                # Copy mp_log to primary log folder as well
                 try:
                     with open(mp_log, "r", encoding="utf-8") as f:
                         append_to_log(primary_log, "\n=== mpremote full log ===\n")
@@ -292,22 +337,14 @@ class KettleUpdaterGUI:
                 except Exception:
                     append_to_log(primary_log, f"\nCould not read mpremote log: {mp_log}\n")
                 self.set_status(f"Error during sync. Log saved: {primary_log}")
-                # Also show a message box to alert
-                try:
-                    messagebox.showerror("Kettle Updater", f"Sync failed. Log saved: {primary_log}")
-                except Exception:
-                    pass
+                self.show_error_box("Kettle Updater", f"Sync failed. Log saved: {primary_log}")
 
         except Exception as e:
             tb = traceback.format_exc()
             append_to_log(primary_log, f"\nEXCEPTION:\n{tb}\n")
-            # try to save detailed trace to a separate file too
             errpath = write_log(f"Exception during run:\n\n{tb}\n", prefix="exception")
             self.set_status(f"Error: {e}. Log: {errpath or primary_log}")
-            try:
-                messagebox.showerror("Kettle Updater - Error", f"An error occurred. Log: {errpath or primary_log}")
-            except Exception:
-                pass
+            self.show_error_box("Kettle Updater - Error", f"An error occurred. Log: {errpath or primary_log}")
         finally:
             def _cleanup():
                 try:
@@ -316,7 +353,7 @@ class KettleUpdaterGUI:
                 except Exception:
                     pass
                 self.run_button.config(state="normal")
-            # keep logs accessible for a short while, then cleanup
+            # restore UI quickly but keep logs around
             self.master.after(2000, _cleanup)
 
 def main():
