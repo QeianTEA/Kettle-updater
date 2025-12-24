@@ -1,13 +1,10 @@
 #!/usr/bin/env python3
 """
-Kettle Updater - GUI (fixed):
-- detects device (best-effort),
-- downloads GitHub repo branch as zip,
-- syncs files to the device using mpremote invoked IN-PROCESS (no spawning the exe),
-- writes logs to C:\kettle_updater_logs\ (fallback to user home),
-- shows a happy face on success.
+Kettle Updater - GUI (with pre/post verification)
+- Lists files on device before sync, syncs, lists after,
+- Writes logs to C:\kettle_updater_logs\ (fallback to user home),
+- Shows explicit success / no-changes / failure messages.
 """
-
 import os
 import sys
 import tempfile
@@ -32,13 +29,11 @@ import io
 # ----------------- Logging setup -----------------
 
 def get_log_dir():
-    """Prefer C:\kettle_updater_logs but fall back to user's home if not writable."""
     preferred = None
     if os.name == "nt":
         preferred = r"C:\kettle_updater_logs"
     else:
         preferred = os.path.join(os.path.expanduser("~"), ".kettle_updater_logs")
-
     try:
         os.makedirs(preferred, exist_ok=True)
         test_path = os.path.join(preferred, ".write_test")
@@ -59,17 +54,12 @@ def new_log_path(prefix="kettle_updater"):
     return os.path.join(LOG_DIR, fname)
 
 def write_log(text, prefix="kettle_updater"):
-    """
-    Write `text` to a new log file and return the path.
-    Robust fallback to temp dir if needed.
-    """
     path = new_log_path(prefix)
     try:
         with open(path, "w", encoding="utf-8") as f:
             f.write(text)
         return path
     except Exception:
-        # last-resort fallback in temp dir
         try:
             tmp = os.path.join(tempfile.gettempdir(), os.path.basename(path))
             with open(tmp, "w", encoding="utf-8") as f:
@@ -85,13 +75,9 @@ def append_to_log(path, text):
     except Exception:
         pass
 
-# ----------------- Helper functions -----------------
+# ----------------- Helpers -----------------
 
 def detect_kettle_ports():
-    """
-    Best-effort detection of device-like serial ports.
-    Returns list of port strings (Windows: COMx).
-    """
     results = []
     if list_ports is None:
         return results
@@ -103,28 +89,20 @@ def detect_kettle_ports():
             except Exception:
                 vid = pid = None
             desc = " ".join(filter(None, [p.description, p.product, p.manufacturer])).lower()
-            # Heuristics: common VID values and descriptive strings
             if vid is not None and vid in (0x2E8A, 0x1D50, 0x10C4, 0x0403):
-                results.append(p.device)
-                continue
+                results.append(p.device); continue
             if any(k in desc for k in ("kettle", "pico", "raspberry", "rp2040", "usb serial", "usb-serial")):
-                results.append(p.device)
-                continue
+                results.append(p.device); continue
     except Exception:
         return []
     return results
 
 def download_github_zip(repo_url, branch="main"):
-    """
-    Download GitHub repo as zip and extract.
-    Returns (tmpdir, repo_root).
-    """
     if repo_url.endswith(".git"):
         repo_url = repo_url[:-4]
     if repo_url.startswith("git@github.com:"):
         repo_url = repo_url.replace("git@github.com:", "https://github.com/")
     repo_url = repo_url.rstrip("/")
-
     zip_url = repo_url + "/archive/refs/heads/" + branch + ".zip"
     tmpdir = tempfile.mkdtemp(prefix="kettle_updater_")
     zip_path = os.path.join(tmpdir, "repo.zip")
@@ -134,43 +112,33 @@ def download_github_zip(repo_url, branch="main"):
     except Exception as e:
         shutil.rmtree(tmpdir, ignore_errors=True)
         raise RuntimeError(f"Failed to download repo zip: {e}\nTried URL: {zip_url}")
-
     try:
         with zipfile.ZipFile(zip_path, "r") as z:
             z.extractall(tmpdir)
     except Exception as e:
         shutil.rmtree(tmpdir, ignore_errors=True)
         raise RuntimeError(f"Failed to extract repo zip: {e}")
-
     entries = [os.path.join(tmpdir, n) for n in os.listdir(tmpdir) if os.path.isdir(os.path.join(tmpdir, n))]
     if not entries:
         raise RuntimeError("Downloaded zip did not contain expected repository files.")
     repo_root = entries[0]
     return tmpdir, repo_root
 
-def run_mpremote_inprocess(argv_list, status_callback=None, timeout_seconds=900):
-    """
-    Run mpremote in-process using runpy.run_module('mpremote').
-    - argv_list should be like: ['mpremote','connect','auto','fs','sync','<local_path>',':']
-    Returns (rc, output, logpath)
-    rc: 0 success, nonzero error.
-    """
+# Run mpremote in-process and capture stdout/stderr
+def run_mpremote_inprocess(argv_list):
     logpath = new_log_path("mpremote")
-    # capture stdout/stderr
     old_argv = sys.argv[:]
     old_stdout = sys.stdout
     old_stderr = sys.stderr
     sio_out = io.StringIO()
     sio_err = io.StringIO()
-    sys.argv = argv_list[:]  # mpremote reads sys.argv
+    sys.argv = argv_list[:]
     sys.stdout = sio_out
     sys.stderr = sio_err
     rc = 0
     try:
-        # run the mpremote module as __main__ (this runs the CLI)
         runpy.run_module("mpremote", run_name="__main__")
     except SystemExit as se:
-        # mpremote may call sys.exit(n)
         try:
             rc = int(se.code) if (se.code is not None and str(se.code).isdigit()) else (0 if se.code is None else 1)
         except Exception:
@@ -180,7 +148,6 @@ def run_mpremote_inprocess(argv_list, status_callback=None, timeout_seconds=900)
         sio_err.write("\nUNCAUGHT EXCEPTION IN mpremote:\n")
         sio_err.write(traceback.format_exc())
     finally:
-        # restore
         sys.argv = old_argv
         sys.stdout = old_stdout
         sys.stderr = old_stderr
@@ -194,49 +161,23 @@ def run_mpremote_inprocess(argv_list, status_callback=None, timeout_seconds=900)
         return rc, out_text, logpath
 
 def run_mpremote_sync(local_path, port=None, extra_args=None, status_callback=None):
-    """
-    High-level wrapper that prefers in-process invocation.
-    Builds argv and calls run_mpremote_inprocess.
-    """
     if extra_args is None:
         extra_args = []
     target = "auto" if port is None else port
     argv = ["mpremote", "connect", target, "fs", "sync", local_path, ":"] + extra_args
     if status_callback:
-        status_callback(f"Invoking mpremote (in-process)...")
-    # Try in-process first (works well when mpremote is bundled into exe as a module)
-    try:
-        rc, out, logpath = run_mpremote_inprocess(argv, status_callback=status_callback)
-        return rc, out, logpath
-    except Exception as e:
-        # Fallback: try subprocess (may spawn exe if packaged; we log that attempt)
-        fallback_log = new_log_path("mpremote_fallback")
-        try:
-            with open(fallback_log, "w", encoding="utf-8") as f:
-                f.write("Falling back to subprocess invocation\n")
-        except Exception:
-            pass
-        try:
-            import subprocess
-            cmd = [sys.executable, "-m", "mpremote"] + argv[1:]
-            if status_callback:
-                status_callback(f"Running fallback subprocess: {' '.join(cmd)}")
-            proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=900)
-            out = proc.stdout or ""
-            try:
-                with open(fallback_log, "a", encoding="utf-8") as f:
-                    f.write(out)
-            except Exception:
-                pass
-            return proc.returncode, out, fallback_log
-        except Exception as e2:
-            msg = f"Both in-process and subprocess mpremote failed: {e}\nFallback error: {e2}"
-            try:
-                with open(fallback_log, "a", encoding="utf-8") as f:
-                    f.write(msg + "\n" + traceback.format_exc())
-            except Exception:
-                pass
-            return 1, msg, fallback_log
+        status_callback("Invoking mpremote (in-process) for sync...")
+    rc, out, logpath = run_mpremote_inprocess(argv)
+    return rc, out, logpath
+
+def run_mpremote_ls(port=None):
+    target = "auto" if port is None else port
+    argv = ["mpremote", "connect", target, "fs", "ls", ":"]
+    rc, out, logpath = run_mpremote_inprocess(argv)
+    # produce a simple set of file entries from output lines
+    lines = [ln.strip() for ln in out.splitlines() if ln.strip()]
+    entries = set(lines)
+    return rc, entries, out, logpath
 
 # ----------------- GUI -----------------
 
@@ -272,8 +213,15 @@ class KettleUpdaterGUI:
             self.status_label.config(text=text)
         self.master.after(0, _set)
 
-    def show_error_box(self, title, msg):
-        # ensure messagebox is called on main thread
+    def show_info(self, title, msg):
+        def _show():
+            try:
+                messagebox.showinfo(title, msg)
+            except Exception:
+                pass
+        self.master.after(0, _show)
+
+    def show_error(self, title, msg):
         def _show():
             try:
                 messagebox.showerror(title, msg)
@@ -288,7 +236,6 @@ class KettleUpdaterGUI:
         if not repo:
             self.set_status("Please enter a GitHub repo URL (e.g. https://github.com/user/repo).")
             return
-        # disable UI while running
         self.run_button.config(state="disabled")
         self.set_status("Starting update...")
         threading.Thread(target=self.worker, args=(repo, branch, subfolder), daemon=True).start()
@@ -300,15 +247,14 @@ class KettleUpdaterGUI:
             append_to_log(primary_log, f"Start: {datetime.now().isoformat()}\n")
             self.set_status("Detecting device (best-effort)...")
             ports = detect_kettle_ports()
-            if ports:
-                porttxt = ", ".join(ports)
-                self.set_status(f"Detected ports: {porttxt}. Using first: {ports[0]}")
-                chosen_port = ports[0]
-                append_to_log(primary_log, f"Detected ports: {porttxt}\n")
-            else:
-                self.set_status("No device-like serial port found. Will let mpremote auto-detect.")
-                chosen_port = None
-                append_to_log(primary_log, "No ports auto-detected; using mpremote auto\n")
+            chosen_port = ports[0] if ports else None
+            append_to_log(primary_log, f"Detected ports: {ports}\nChosen: {chosen_port}\n")
+
+            # pre-list files
+            self.set_status("Listing files on device (before)...")
+            rc_before, entries_before, out_before, before_log = run_mpremote_ls(port=chosen_port)
+            append_to_log(primary_log, f"pre-list rc={rc_before}\nlog={before_log}\n")
+            append_to_log(primary_log, out_before + "\n")
 
             self.set_status("Downloading GitHub repo...")
             tmpdir, repo_root = download_github_zip(repo, branch)
@@ -320,31 +266,56 @@ class KettleUpdaterGUI:
                     raise RuntimeError(f"Subfolder '{subfolder}' not found in the repo.")
                 sync_path = candidate
 
+            # sync
             self.set_status("Syncing files to device (mpremote)...")
-            rc, output, mp_log = run_mpremote_sync(sync_path, port=chosen_port, status_callback=self.set_status)
-            append_to_log(primary_log, f"mpremote return code: {rc}\nmpremote log: {mp_log}\n")
-            if rc == 0:
-                self.set_status("😄 done!")
-                append_to_log(primary_log, "Success!\n")
-                write_log(f"Sync succeeded at {datetime.now().isoformat()}\nRepo: {repo}\nBranch: {branch}\n", prefix="success")
+            rc_sync, out_sync, sync_log = run_mpremote_sync(sync_path, port=chosen_port)
+            append_to_log(primary_log, f"sync rc={rc_sync}\nsync_log={sync_log}\n")
+            append_to_log(primary_log, out_sync + "\n")
+
+            # post-list files
+            self.set_status("Listing files on device (after)...")
+            rc_after, entries_after, out_after, after_log = run_mpremote_ls(port=chosen_port)
+            append_to_log(primary_log, f"post-list rc={rc_after}\nlog={after_log}\n")
+            append_to_log(primary_log, out_after + "\n")
+
+            # Diff
+            added = sorted(list(entries_after - entries_before))
+            removed = sorted(list(entries_before - entries_after))
+            common = sorted(list(entries_before & entries_after))
+
+            # Interpret results
+            if rc_sync == 0 and (len(added) > 0 or len(removed) > 0):
+                msg = (f"Sync reported success.\nFiles added: {len(added)}\nFiles removed: {len(removed)}\n"
+                       f"See logs in:\n{primary_log}\n{sync_log}\n{before_log}\n{after_log}")
+                self.set_status("😄 done! Files changed.")
+                append_to_log(primary_log, "Result: files changed.\n")
+                self.show_info("Kettle Updater - Done", msg)
+            elif rc_sync == 0 and (len(added) == 0 and len(removed) == 0):
+                # no changed files
+                msg = ("Sync completed but no files changed on the device.\n\n"
+                       "Possible reasons:\n"
+                       "• The device already had the same files (no update required).\n"
+                       "• You selected the wrong subfolder in the repo (check 'Subfolder to sync').\n"
+                       "• The repo branch you selected is empty/different.\n\n"
+                       "Check these logs for details:\n"
+                       f"{primary_log}\n{sync_log}\n{before_log}\n{after_log}")
+                self.set_status("Done — no changes detected.")
+                append_to_log(primary_log, "Result: no changes detected.\n")
+                self.show_info("Kettle Updater - No changes", msg)
             else:
-                out_text = f"mpremote rc={rc}\n\nmpremote output:\n{output}\n"
-                append_to_log(primary_log, out_text)
-                try:
-                    with open(mp_log, "r", encoding="utf-8") as f:
-                        append_to_log(primary_log, "\n=== mpremote full log ===\n")
-                        append_to_log(primary_log, f.read())
-                except Exception:
-                    append_to_log(primary_log, f"\nCould not read mpremote log: {mp_log}\n")
-                self.set_status(f"Error during sync. Log saved: {primary_log}")
-                self.show_error_box("Kettle Updater", f"Sync failed. Log saved: {primary_log}")
+                # sync reported nonzero return code or other error
+                msg = (f"Sync may have failed (rc={rc_sync}).\nCheck logs:\n{primary_log}\n{sync_log}\n{before_log}\n{after_log}\n\n"
+                       "If mpremote couldn't find the device, check cable/driver or try holding BOOTSEL and replugging.")
+                self.set_status("Error during sync. See logs.")
+                append_to_log(primary_log, f"Sync reported failure rc={rc_sync}\n")
+                self.show_error("Kettle Updater - Error", msg)
 
         except Exception as e:
             tb = traceback.format_exc()
             append_to_log(primary_log, f"\nEXCEPTION:\n{tb}\n")
             errpath = write_log(f"Exception during run:\n\n{tb}\n", prefix="exception")
             self.set_status(f"Error: {e}. Log: {errpath or primary_log}")
-            self.show_error_box("Kettle Updater - Error", f"An error occurred. Log: {errpath or primary_log}")
+            self.show_error("Kettle Updater - Error", f"An error occurred. Log: {errpath or primary_log}")
         finally:
             def _cleanup():
                 try:
@@ -353,7 +324,6 @@ class KettleUpdaterGUI:
                 except Exception:
                     pass
                 self.run_button.config(state="normal")
-            # restore UI quickly but keep logs around
             self.master.after(2000, _cleanup)
 
 def main():
